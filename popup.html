@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    :root {
+      --bg: #0b0e11;
+      --surface: #131720;
+      --surface2: #1a1f2e;
+      --border: #1e2536;
+      --text: #c5cdd8;
+      --text-dim: #5a6578;
+      --accent: #00e5ff;
+      --accent-dim: rgba(0, 229, 255, 0.08);
+      --critical: #ff1744;
+      --high: #ff6d00;
+      --medium: #ffab00;
+      --low: #00b0ff;
+      --info: #546e7a;
+      --safe: #00e676;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 460px;
+      max-height: 580px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: 11px;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    body::-webkit-scrollbar { width: 4px; }
+    body::-webkit-scrollbar-track { background: var(--bg); }
+    body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    /* ---- Header ---- */
+    .header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .eye-icon {
+      width: 22px;
+      height: 22px;
+      border: 2px solid var(--accent);
+      border-radius: 50% 0;
+      transform: rotate(45deg);
+      position: relative;
+      box-shadow: 0 0 8px rgba(0, 229, 255, 0.3);
+    }
+    .eye-icon::after {
+      content: '';
+      position: absolute;
+      width: 8px;
+      height: 8px;
+      background: var(--accent);
+      border-radius: 50%;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 6px var(--accent);
+    }
+    .logo-text {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      text-shadow: 0 0 10px rgba(0, 229, 255, 0.3);
+    }
+    .logo-sub {
+      font-size: 9px;
+      color: var(--text-dim);
+      letter-spacing: 1px;
+      margin-top: 2px;
+    }
+
+    .stats {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .stat {
+      text-align: center;
+    }
+    .stat-num {
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .stat-label {
+      font-size: 8px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .target-url {
+      margin-top: 8px;
+      padding: 4px 8px;
+      background: var(--surface2);
+      border-radius: 3px;
+      font-size: 10px;
+      color: var(--text-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* ---- Sections ---- */
+    .section {
+      border-bottom: 1px solid var(--border);
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s;
+    }
+    .section-header:hover {
+      background: var(--accent-dim);
+    }
+    .section-title {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-dim);
+    }
+    .section-count {
+      font-size: 10px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 3px;
+      min-width: 18px;
+      text-align: center;
+    }
+    .section-body {
+      padding: 0 16px 12px;
+      display: none;
+    }
+    .section.open .section-body { display: block; }
+    .section.open .section-header .chevron { transform: rotate(90deg); }
+    .chevron {
+      color: var(--text-dim);
+      transition: transform 0.2s;
+      font-size: 10px;
+    }
+
+    /* ---- Finding cards ---- */
+    .finding {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--info);
+      border-radius: 0 4px 4px 0;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+    }
+    .finding.critical { border-left-color: var(--critical); }
+    .finding.high { border-left-color: var(--high); }
+    .finding.medium { border-left-color: var(--medium); }
+    .finding.low { border-left-color: var(--low); }
+    .finding.info { border-left-color: var(--info); }
+
+    .finding-top {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
+    .sev-badge {
+      font-size: 8px;
+      font-weight: 700;
+      padding: 1px 4px;
+      border-radius: 2px;
+      color: #000;
+      letter-spacing: 0.3px;
+      flex-shrink: 0;
+    }
+    .sev-badge.critical { background: var(--critical); color: #fff; }
+    .sev-badge.high { background: var(--high); }
+    .sev-badge.medium { background: var(--medium); }
+    .sev-badge.low { background: var(--low); }
+    .sev-badge.info { background: var(--info); color: #fff; }
+
+    .finding-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .finding-detail {
+      font-size: 10px;
+      color: var(--text-dim);
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-top: 2px;
+    }
+    .finding-meta {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+      font-size: 9px;
+      color: var(--text-dim);
+    }
+    .cve-tag {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .lib-tag {
+      color: var(--medium);
+    }
+    .confidence-tag {
+      padding: 0 4px;
+      border-radius: 2px;
+      font-size: 8px;
+    }
+    .confidence-tag.high {
+      background: rgba(255, 23, 68, 0.15);
+      color: var(--critical);
+    }
+    .confidence-tag.low {
+      background: rgba(84, 110, 122, 0.2);
+      color: var(--info);
+    }
+
+    /* ---- Libraries grid ---- */
+    .lib-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .lib-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      font-size: 10px;
+    }
+    .lib-chip .lib-name { color: var(--text); font-weight: 600; }
+    .lib-chip .lib-ver { color: var(--accent); }
+    .lib-chip.vuln { border-color: var(--critical); background: rgba(255, 23, 68, 0.06); }
+
+    /* ---- Exploit / Copy blocks ---- */
+    .cmd-block {
+      position: relative;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 8px 32px 8px 8px;
+      margin: 4px 0;
+      font-family: 'Consolas', monospace;
+      font-size: 10px;
+      color: var(--safe);
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.4;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .cmd-block.burp { color: var(--medium); }
+    .cmd-label {
+      font-size: 8px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-dim);
+      margin-top: 6px;
+      margin-bottom: 2px;
+    }
+    .cmd-label .tool-name { color: var(--accent); }
+    .copy-btn {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+      transition: all 0.15s;
+    }
+    .copy-btn:hover { background: var(--accent-dim); color: var(--accent); border-color: var(--accent); }
+    .copy-btn.copied { background: rgba(0, 230, 118, 0.15); color: var(--safe); border-color: var(--safe); }
+
+    /* ---- Attack surface ---- */
+    .surface-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      margin-bottom: 3px;
+      font-size: 10px;
+    }
+    .surface-method {
+      font-weight: 700;
+      font-size: 9px;
+      padding: 1px 4px;
+      border-radius: 2px;
+      color: #000;
+    }
+    .surface-method.GET { background: var(--safe); }
+    .surface-method.POST { background: var(--medium); }
+    .surface-method.PUT { background: var(--high); }
+    .surface-method.DELETE { background: var(--critical); color: #fff; }
+    .surface-method.WS { background: #9c27b0; color: #fff; }
+    .surface-method.PARAM { background: var(--low); }
+    .surface-method.UPLOAD { background: var(--critical); color: #fff; }
+    .surface-method.HIDDEN { background: var(--info); color: #fff; }
+    .surface-path { color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .surface-source { color: var(--text-dim); font-size: 9px; }
+
+    /* ---- Empty state ---- */
+    .empty {
+      text-align: center;
+      padding: 16px;
+      color: var(--text-dim);
+      font-size: 10px;
+    }
+    .empty .icon { font-size: 18px; margin-bottom: 4px; }
+
+    /* ---- Loading ---- */
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 40px;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .scanner-line {
+      width: 120px;
+      height: 2px;
+      background: var(--surface2);
+      border-radius: 1px;
+      overflow: hidden;
+      position: relative;
+    }
+    .scanner-line::after {
+      content: '';
+      position: absolute;
+      width: 40px;
+      height: 100%;
+      background: var(--accent);
+      border-radius: 1px;
+      animation: scan 1.2s ease-in-out infinite;
+      box-shadow: 0 0 8px var(--accent);
+    }
+    @keyframes scan {
+      0% { left: -40px; }
+      100% { left: 120px; }
+    }
+    .loading-text {
+      color: var(--text-dim);
+      font-size: 10px;
+      letter-spacing: 1px;
+    }
+
+    /* ---- Footer ---- */
+    .footer {
+      padding: 8px 16px;
+      text-align: center;
+      font-size: 9px;
+      color: var(--text-dim);
+      border-top: 1px solid var(--border);
+      letter-spacing: 0.5px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="loading" id="loader">
+      <div class="eye-icon" style="width:32px;height:32px;"></div>
+      <div class="scanner-line"></div>
+      <div class="loading-text">SCANNING TARGET</div>
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
