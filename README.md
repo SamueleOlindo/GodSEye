@@ -75,7 +75,7 @@ When `React.version` isn't exposed, infers version from DOM properties (`__react
 
 1. Clone or download this repository
    ```bash
-   git clone https://github.com/YOUR_USERNAME/GodSEye.git
+   git clone https://github.com/SamueleOlindo/GodSEye.git
    ```
 2. Open your browser and navigate to `chrome://extensions`
 3. Enable **Developer mode** (toggle in the top-right corner)
