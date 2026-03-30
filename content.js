@@ -1537,7 +1537,7 @@
       for (const entry of coreEntries) {
         if (!isBelow(result.coreVersion, entry.fixed)) continue;
         if (entry.from && isBelow(result.coreVersion, entry.from)) continue;
-        result.cve.push({ ...entry, lib: "WordPress Core", version: result.coreVersion, confidence: "confirmed" });
+        result.cve.push({ ...entry, lib: "WordPress Core", version: result.coreVersion, confidence: "confirmed", attackContext: classifyCveContext(entry.title, "wordpress") });
       }
     }
 
@@ -1549,7 +1549,7 @@
         if (plugin.version && isValidVersion(plugin.version)) {
           if (!isBelow(plugin.version, entry.fixed)) continue;
           if (entry.from && isBelow(plugin.version, entry.from)) continue;
-          result.cve.push({ ...entry, lib: plugin.slug, version: plugin.version, confidence: "confirmed" });
+          result.cve.push({ ...entry, lib: plugin.slug, version: plugin.version, confidence: "confirmed", attackContext: classifyCveContext(entry.title, plugin.slug) });
         } else if (!plugin.version) {
           // Downgrade severity by one level for unverified versions
           const sevDown = { "CRITICAL": "HIGH", "HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "LOW" };
@@ -1572,6 +1572,7 @@
             title: entry.title + " (version not confirmed)",
             authRequired: !isUnauth,
             authTag,
+            attackContext: classifyCveContext(entry.title, plugin.slug),
             note: authNote,
           });
         }
@@ -1678,6 +1679,32 @@
     return sorted[sorted.length - 1];
   }
 
+  /**
+   * Classify a CVE as CLIENT, SERVER, or BOTH based on its title and library.
+   * CLIENT = exploitable via browser/HTTP against the target
+   * SERVER = requires server-side access or targets server runtime
+   */
+  function classifyCveContext(title, lib) {
+    const t = title.toLowerCase();
+    // Server-only patterns
+    if (/\brce\b|remote code|command injection|code injection|code execution/.test(t)) return "SERVER";
+    if (/\bssrf\b|server.side request/.test(t)) return "SERVER";
+    if (/path traversal|file read|file inclusion|arbitrary file|directory traversal/.test(t)) return "SERVER";
+    if (/auth bypass|authentication bypass|privilege escalation/.test(t)) return "SERVER";
+    if (/\bdos\b|denial.of.service|cache poisoning/.test(t)) return "SERVER";
+    if (/open redirect/.test(t)) return "SERVER";
+    // Server-only libraries (always server context when detected client-side)
+    if (/^(express|fastify|helmet|webpack-dev-server|storybook|gatsby|electron|minimist|serialize-javascript|node-forge|jsonwebtoken)$/.test(lib)) return "SERVER";
+    // Template engines used server-side
+    if (/^(ejs|pug|nunjucks|handlebars)$/.test(lib) && /rce|code|template/.test(t)) return "SERVER";
+    // Client patterns
+    if (/\bxss\b|cross.site|mxss|dom clobber/.test(t)) return "CLIENT";
+    // Both: prototype pollution and ReDoS can be either
+    if (/prototype pollution|redos|regexp/.test(t)) return "BOTH";
+    // Default
+    return "BOTH";
+  }
+
   function matchCVEs(libraries) {
     const findings = [];
     // Collect detected tech slugs for context checks
@@ -1716,11 +1743,14 @@
           }
         }
 
+        const attackContext = classifyCveContext(entry.title, lib);
+
         findings.push({
           ...entry,
           severity,
           fixed: displayFix,
           note,
+          attackContext,
           lib, version, confidence: "confirmed", method: info.m,
         });
       }
@@ -2033,7 +2063,13 @@
       }
     }
 
-    vulnerabilities.sort((a, b) => (GODSEYE_SEVERITY_WEIGHT[b.severity] || 0) - (GODSEYE_SEVERITY_WEIGHT[a.severity] || 0));
+    // Sort: severity desc, then CLIENT before SERVER/BOTH at same severity
+    const ctxWeight = { "CLIENT": 2, "BOTH": 1, "SERVER": 0 };
+    vulnerabilities.sort((a, b) => {
+      const sevDiff = (GODSEYE_SEVERITY_WEIGHT[b.severity] || 0) - (GODSEYE_SEVERITY_WEIGHT[a.severity] || 0);
+      if (sevDiff !== 0) return sevDiff;
+      return (ctxWeight[b.attackContext] || 0) - (ctxWeight[a.attackContext] || 0);
+    });
 
     // Attach exploit commands from CVE exploit-gen to matching vulns
     for (const vuln of vulnerabilities) {

@@ -50,6 +50,7 @@
     if (f.lib) meta += `<span class="lib-tag">${escapeHtml(f.lib)}${f.version ? "@" + escapeHtml(f.version) : ""}</span>`;
     if (f.fixed) meta += `<span>fixed: ${escapeHtml(f.fixed)}</span>`;
     if (f.confidence) meta += `<span class="confidence-tag ${safeClass(f.confidence)}">${escapeHtml(f.confidence)}</span>`;
+    if (f.attackContext) meta += `<span class="ctx-tag ${safeClass(f.attackContext)}">${escapeHtml(f.attackContext)}</span>`;
     if (f.authTag) meta += `<span class="auth-tag ${safeClass(f.authRequired ? "auth" : "noauth")}">${escapeHtml(f.authTag)}</span>`;
     if (f.method) meta += `<span style="color:var(--accent)">via ${escapeHtml(f.method)}</span>`;
     if (f.note) meta += `<span>${escapeHtml(f.note)}</span>`;

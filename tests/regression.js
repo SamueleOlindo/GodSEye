@@ -585,6 +585,59 @@ assert(
 
 
 // ═══════════════════════════════════════════════════════════
+//  TEST 10: CVE context classification (CLIENT/SERVER/BOTH)
+// ═══════════════════════════════════════════════════════════
+
+console.log("\n── Test 10: CVE context classification ──");
+
+function classifyCveContext(title, lib) {
+  const t = title.toLowerCase();
+  if (/\brce\b|remote code|command injection|code injection|code execution/.test(t)) return "SERVER";
+  if (/\bssrf\b|server.side request/.test(t)) return "SERVER";
+  if (/path traversal|file read|file inclusion|arbitrary file|directory traversal/.test(t)) return "SERVER";
+  if (/auth bypass|authentication bypass|privilege escalation/.test(t)) return "SERVER";
+  if (/\bdos\b|denial.of.service|cache poisoning/.test(t)) return "SERVER";
+  if (/open redirect/.test(t)) return "SERVER";
+  if (/^(express|fastify|helmet|webpack-dev-server|storybook|gatsby|electron|minimist|serialize-javascript|node-forge|jsonwebtoken)$/.test(lib)) return "SERVER";
+  if (/^(ejs|pug|nunjucks|handlebars)$/.test(lib) && /rce|code|template/.test(t)) return "SERVER";
+  if (/\bxss\b|cross.site|mxss|dom clobber/.test(t)) return "CLIENT";
+  if (/prototype pollution|redos|regexp/.test(t)) return "BOTH";
+  return "BOTH";
+}
+
+// CLIENT — browser-exploitable
+assert(classifyCveContext("XSS via data-target attribute", "bootstrap") === "CLIENT", "Bootstrap XSS → CLIENT");
+assert(classifyCveContext("mXSS bypass via namespace confusion", "dompurify") === "CLIENT", "DOMPurify mXSS → CLIENT");
+assert(classifyCveContext("DOM clobbering XSS via AutoPublicPath", "webpack") === "CLIENT", "Webpack DOM clobbering → CLIENT");
+assert(classifyCveContext("XSS via interpolation nesting", "i18next") === "CLIENT", "i18next XSS → CLIENT");
+assert(classifyCveContext("Stored XSS via custom attributes", "elementor") === "CLIENT", "Elementor Stored XSS → CLIENT");
+
+// SERVER — requires server access
+assert(classifyCveContext("RCE via template compilation", "handlebars") === "SERVER", "Handlebars RCE → SERVER");
+assert(classifyCveContext("Path traversal in locale loading", "moment") === "SERVER", "Moment path traversal → SERVER");
+assert(classifyCveContext("SSRF via protocol-relative URL", "axios") === "SERVER", "Axios SSRF → SERVER");
+assert(classifyCveContext("Middleware auth bypass via x-middleware-subrequest", "next") === "SERVER", "Next.js auth bypass → SERVER");
+assert(classifyCveContext("RCE via outputFunctionName injection", "ejs") === "SERVER", "EJS RCE → SERVER");
+assert(classifyCveContext("Command injection via template()", "lodash") === "SERVER", "Lodash command injection → SERVER");
+assert(classifyCveContext("Unauthenticated arbitrary file upload", "forminator") === "SERVER", "Forminator file upload → SERVER");
+assert(classifyCveContext("Cache poisoning via X-Now-Route-Matches", "next") === "SERVER", "Next.js cache poisoning → SERVER");
+assert(classifyCveContext("Open redirect via malformed URLs", "express") === "SERVER", "Express open redirect → SERVER");
+assert(classifyCveContext("DoS via unhandled error event", "socket.io") === "SERVER", "Socket.IO DoS → SERVER");
+
+// SERVER — server-only libraries (regardless of title)
+assert(classifyCveContext("Content-Type validation bypass", "fastify") === "SERVER", "Fastify (server lib) → SERVER");
+assert(classifyCveContext("CSP bypass via header merging", "helmet") === "SERVER", "Helmet (server lib) → SERVER");
+assert(classifyCveContext("Source code theft via WebSocket", "webpack-dev-server") === "SERVER", "webpack-dev-server → SERVER");
+assert(classifyCveContext("Signature bypass via none algorithm", "jsonwebtoken") === "SERVER", "jsonwebtoken → SERVER");
+
+// BOTH — depends on usage context
+assert(classifyCveContext("Prototype pollution via defaultsDeep()", "lodash") === "BOTH", "Lodash prototype pollution → BOTH");
+assert(classifyCveContext("ReDoS in RFC2822 date parsing", "moment") === "BOTH", "Moment ReDoS → BOTH");
+assert(classifyCveContext("ReDoS via crafted input", "highlight.js") === "BOTH", "highlight.js ReDoS → BOTH");
+assert(classifyCveContext("Prototype pollution via options merge", "chart.js") === "BOTH", "Chart.js prototype pollution → BOTH");
+
+
+// ═══════════════════════════════════════════════════════════
 //  RESULTS
 // ═══════════════════════════════════════════════════════════
 
