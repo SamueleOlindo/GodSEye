@@ -1125,13 +1125,12 @@
       const skipParams = /^(utm_.*|fbclid|gclid|_ga|_gid|__cf.*|wbraid|gbraid)$/i;
       params.forEach((value, key) => {
         if (skipParams.test(key)) return;
-        // Skip short/alphanumeric-only values (IDs, hashes — not exploitable)
-        if (/^[a-zA-Z0-9_-]+$/.test(value)) return;
+        // Skip short values and pure alphanumeric (no special chars = not exploitable)
         if (value.length <= 5) return;
+        if (/^[a-zA-Z0-9\s_.,-]+$/.test(value)) return;
         if (html.includes(value)) {
           // Context scoring: where is it reflected?
           const idx = html.indexOf(value);
-          const ctx = html.substring(Math.max(0, idx - 30), idx + value.length + 30);
           const inScript = /<script[^>]*>[\s\S]*$/.test(html.substring(Math.max(0, idx - 500), idx));
           const inAttr = /=["'][^"']*$/.test(html.substring(Math.max(0, idx - 80), idx));
           const inTag = /<[a-z][^>]*$/.test(html.substring(Math.max(0, idx - 100), idx));
@@ -1281,9 +1280,18 @@
         ] });
     }
 
-    const defaultCreds = html.match(/<!--[\s\S]*?(?:password|credential|default.*?login|admin\s*:\s*admin)[\s\S]*?-->/gi);
-    if (defaultCreds) {
-      findings.push({ severity: "HIGH", confidence: "high", title: "Credentials in HTML comments", detail: defaultCreds[0].substring(0, 100), owasp: "A05" });
+    // Only flag comments that contain actual credential-like patterns (key=value, user:pass)
+    const comments = html.match(/<!--[\s\S]*?-->/g) || [];
+    const credComments = comments.filter(c => {
+      const t = c.toLowerCase();
+      // Must contain a value assignment pattern, not just the word "password"
+      return /(?:password|passwd|pwd)\s*[:=]\s*\S/i.test(c)
+          || /(?:admin|root|user)\s*[:\/]\s*(?:admin|root|pass|123)/i.test(c)
+          || /(?:default\s+login|credentials?\s*[:=])/i.test(c)
+          || /(?:api[_-]?key|secret[_-]?key|token)\s*[:=]\s*["']?\w{8,}/i.test(c);
+    });
+    if (credComments.length > 0) {
+      findings.push({ severity: "HIGH", confidence: "high", title: "Credentials in HTML comments", detail: credComments[0].substring(0, 100), owasp: "A05" });
     }
 
     // ── A07: Auth Failures ──
@@ -1543,7 +1551,29 @@
           if (entry.from && isBelow(plugin.version, entry.from)) continue;
           result.cve.push({ ...entry, lib: plugin.slug, version: plugin.version, confidence: "confirmed" });
         } else if (!plugin.version) {
-          result.cve.push({ ...entry, lib: plugin.slug, version: "unknown", confidence: "unverified", title: entry.title + " (version not confirmed)" });
+          // Downgrade severity by one level for unverified versions
+          const sevDown = { "CRITICAL": "HIGH", "HIGH": "MEDIUM", "MEDIUM": "LOW", "LOW": "LOW" };
+          const downgraded = sevDown[entry.severity] || entry.severity;
+
+          // Extract auth requirement from title
+          const titleLower = entry.title.toLowerCase();
+          const isUnauth = /unauthenticated|unauth/i.test(titleLower);
+          const authTag = isUnauth ? "NO AUTH" : "AUTH REQUIRED";
+          const authNote = isUnauth
+            ? "Exploitable without authentication. Verify plugin version before testing."
+            : "Requires authenticated access (editor/admin). Verify plugin version before testing.";
+
+          result.cve.push({
+            ...entry,
+            severity: downgraded,
+            lib: plugin.slug,
+            version: "unknown",
+            confidence: "unverified",
+            title: entry.title + " (version not confirmed)",
+            authRequired: !isUnauth,
+            authTag,
+            note: authNote,
+          });
         }
       }
     }
