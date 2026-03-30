@@ -17,6 +17,10 @@
 (() => {
   "use strict";
 
+  // Guard against double injection (manifest content_scripts + onInstalled)
+  if (window.__GODSEYE_LOADED__) return;
+  window.__GODSEYE_LOADED__ = true;
+
   /* ================================================================== */
   /*  Helpers                                                           */
   /* ================================================================== */
@@ -34,6 +38,14 @@
   function isBelow(ver, ceil) { return semverCmp(ver, ceil) < 0; }
 
   function isValidVersion(v) { return /^\d+\.\d+(\.\d+)?/.test(v); }
+
+  /* ── Cached page HTML — snapshotted once per scan to avoid repeated innerHTML access ── */
+  let _cachedHTML = null;
+  function getPageHTML() {
+    if (_cachedHTML === null) _cachedHTML = document.documentElement.innerHTML;
+    return _cachedHTML;
+  }
+  function invalidateHTMLCache() { _cachedHTML = null; }
 
   /* ================================================================== */
   /*  1. Main World Injection — reads globals from the page context     */
@@ -61,12 +73,349 @@
   }
 
   /* ================================================================== */
-  /*  2. DOM-only Detection (no injection needed)                       */
+  /*  FINGERPRINT ENGINE — Wappalyzer-like multi-source matcher         */
+  /* ================================================================== */
+
+  /**
+   * Collects raw signals from the page once, then evaluates every
+   * fingerprint in GODSEYE_FINGERPRINTS.
+   *
+   * Returns Map<slug, { name, version, method, confidence, cats, evidences[] }>
+   */
+  /** Fetch passively-observed response headers from background.js */
+  function fetchPassiveHeaders() {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage({ action: "get_headers" }, (data) => {
+          if (chrome.runtime.lastError || !data) { resolve(null); return; }
+          resolve(data);
+        });
+      } catch (_) { resolve(null); }
+    });
+  }
+
+  function runFingerprintEngine(mainWorldData, headerData) {
+    // ── 1. Collect raw signals ──
+    const html = getPageHTML().substring(0, 500000);
+
+    // Inline script text (collected once)
+    let scriptText = "";
+    const inlineScripts = document.querySelectorAll("script:not([src])");
+    for (const s of inlineScripts) scriptText += s.textContent.substring(0, 5000) + "\n";
+
+    // Banner text (first 3KB per inline script)
+    let bannerText = "";
+    for (const s of inlineScripts) bannerText += s.textContent.substring(0, 3000) + "\n";
+
+    // External script/link URLs
+    const extUrls = [];
+    document.querySelectorAll("script[src], link[href]").forEach(el => {
+      extUrls.push((el.src || el.href || "").toLowerCase());
+    });
+
+    // Meta tags
+    const metaTags = {};
+    document.querySelectorAll("meta[name], meta[property]").forEach(el => {
+      const key = (el.getAttribute("name") || el.getAttribute("property") || "").toLowerCase();
+      if (key) metaTags[key] = el.content || "";
+    });
+
+    // ── 2. Evaluate each fingerprint ──
+    const detected = new Map(); // slug → { name, version, method, confidence, cats, evidences }
+
+    for (const [slug, fp] of Object.entries(GODSEYE_FINGERPRINTS)) {
+      let totalWeight = 0;
+      const evidences = [];
+      let bestVersion = null;
+      let bestVersionWeight = 0;
+      let bestMethod = null;
+
+      for (const sig of fp.signals) {
+        let matched = false;
+        let version = null;
+        let methodLabel = sig.src;
+
+        switch (sig.src) {
+          case "mw": {
+            const mwd = mainWorldData[slug];
+            if (mwd) {
+              matched = true;
+              if (mwd.v && isValidVersion(mwd.v)) version = mwd.v;
+              methodLabel = mwd.m || "global";
+            }
+            break;
+          }
+          case "dom":
+          case "css": {
+            try {
+              if (sig.sel) {
+                const el = document.querySelector(sig.sel);
+                if (el) {
+                  matched = true;
+                  if (sig.verAttr) {
+                    const av = el.getAttribute(sig.verAttr);
+                    if (av && isValidVersion(av)) version = av;
+                  }
+                  methodLabel = sig.sel.substring(0, 40);
+                }
+              }
+            } catch (_) {}
+            break;
+          }
+          case "html": {
+            if (sig.re) {
+              const m = html.match(sig.re);
+              if (m) {
+                matched = true;
+                if (sig.vg && m[sig.vg] && isValidVersion(m[sig.vg])) version = m[sig.vg];
+              }
+            }
+            break;
+          }
+          case "script": {
+            if (sig.re) {
+              const m = scriptText.match(sig.re);
+              if (m) {
+                matched = true;
+                if (sig.vg && m[sig.vg] && isValidVersion(m[sig.vg])) version = m[sig.vg];
+              }
+            }
+            break;
+          }
+          case "banner": {
+            if (sig.re) {
+              const m = bannerText.match(sig.re);
+              if (m) {
+                matched = true;
+                if (sig.vg && m[sig.vg] && isValidVersion(m[sig.vg])) version = m[sig.vg];
+                methodLabel = "banner";
+              }
+            }
+            break;
+          }
+          case "url": {
+            if (sig.re) {
+              for (const u of extUrls) {
+                const m = u.match(sig.re);
+                if (m) {
+                  matched = true;
+                  if (sig.vg && m[sig.vg] && isValidVersion(m[sig.vg])) version = m[sig.vg];
+                  methodLabel = "script_url";
+                  break;
+                }
+              }
+            }
+            break;
+          }
+          case "meta": {
+            if (sig.name) {
+              const val = metaTags[sig.name.toLowerCase()];
+              if (val !== undefined) {
+                if (sig.re) {
+                  const m = val.match(sig.re);
+                  if (m) {
+                    matched = true;
+                    if (sig.vg && m[sig.vg] && isValidVersion(m[sig.vg])) version = m[sig.vg];
+                    methodLabel = "meta:" + sig.name;
+                  }
+                } else {
+                  matched = true;
+                  methodLabel = "meta:" + sig.name;
+                }
+              }
+            }
+            break;
+          }
+        }
+
+        if (matched) {
+          // Auto-assign tier if not explicit
+          const tier = sig.t || (
+            (sig.src === "mw" && version) ? "s" :
+            (sig.src === "banner" && version) ? "s" :
+            (sig.src === "meta" && version) ? "s" :
+            (sig.w >= 70) ? "m" :
+            "w"
+          );
+          totalWeight += sig.w;
+          evidences.push({ signal: sig.src, detail: methodLabel, weight: sig.w, version, tier });
+          if (version && sig.w > bestVersionWeight) {
+            bestVersion = version;
+            bestVersionWeight = sig.w;
+            bestMethod = methodLabel;
+          }
+        }
+      }
+
+      // ── Tier-based threshold ──
+      // 1 strong, OR 2 medium from different sources, OR 3 weak from different sources
+      const strongs = evidences.filter(e => e.tier === "s");
+      const mediums = evidences.filter(e => e.tier === "m");
+      const weaks   = evidences.filter(e => e.tier === "w");
+      const medSources = new Set(mediums.map(e => e.signal));
+      const weakSources = new Set(weaks.map(e => e.signal));
+
+      const meetsThreshold = strongs.length >= 1
+        || medSources.size >= 2
+        || (medSources.size >= 1 && weakSources.size >= 1)
+        || weakSources.size >= 3;
+
+      if (meetsThreshold && totalWeight >= 50) {
+        const conf = strongs.length > 0 ? "high" : medSources.size >= 2 ? "medium" : "low";
+        detected.set(slug, {
+          name: fp.name,
+          version: bestVersion || "detected",
+          method: bestMethod || (evidences[0] ? evidences[0].detail : "fingerprint"),
+          confidence: conf,
+          confidenceScore: Math.min(totalWeight, 100),
+          cats: fp.cats || [],
+          evidences,
+          evidenceCount: evidences.length,
+          evidenceSources: [...new Set(evidences.map(e => e.signal))],
+          versionSource: bestMethod,
+        });
+      }
+    }
+
+    // ── 2b. Passive header signals ──
+    if (headerData) {
+      const hdrSignals = [];
+      if (headerData.server) {
+        const s = headerData.server.toLowerCase();
+        if (/nginx/i.test(s)) hdrSignals.push(["nginx", s]);
+        if (/apache/i.test(s)) hdrSignals.push(["apache", s]);
+        if (/cloudflare/i.test(s)) hdrSignals.push(["cloudflare", s]);
+        if (/iis/i.test(s)) hdrSignals.push(["iis", s]);
+        if (/openresty/i.test(s)) hdrSignals.push(["openresty", s]);
+      }
+      if (headerData.poweredBy) {
+        const p = headerData.poweredBy;
+        if (/php/i.test(p)) hdrSignals.push(["php", p]);
+        if (/asp\.net/i.test(p)) hdrSignals.push(["asp.net", p]);
+        if (/express/i.test(p)) hdrSignals.push(["express", p]);
+        if (/next\.js/i.test(p)) hdrSignals.push(["next", p]);
+        if (/drupal/i.test(p)) hdrSignals.push(["drupal", p]);
+      }
+      for (const [slug, detail] of hdrSignals) {
+        const existing = detected.get(slug);
+        if (existing) {
+          existing.evidences.push({ signal: "header", detail, weight: 80, tier: "s" });
+          existing.confidenceScore = Math.min(100, existing.confidenceScore + 80);
+          if (existing.confidence === "low") existing.confidence = "medium";
+        } else {
+          detected.set(slug, {
+            name: slug, version: "detected", method: "response header",
+            confidence: "medium", confidenceScore: 80,
+            cats: ["server"], evidences: [{ signal: "header", detail, weight: 80, tier: "m" }],
+            evidenceCount: 1, evidenceSources: ["header"],
+          });
+        }
+      }
+      // Set-Cookie names as supplementary signals
+      for (const cookie of (headerData.setCookies || [])) {
+        if (/PHPSESSID/i.test(cookie)) {
+          const e = detected.get("php");
+          if (e) e.evidences.push({ signal: "cookie", detail: "PHPSESSID", weight: 40, tier: "w" });
+        }
+        if (/JSESSIONID/i.test(cookie)) {
+          if (!detected.has("java")) detected.set("java", { name: "Java", version: "detected", method: "JSESSIONID cookie", confidence: "medium", confidenceScore: 60, cats: ["server"], evidences: [{ signal: "cookie", detail: "JSESSIONID", weight: 60, tier: "m" }] });
+        }
+        if (/ASP\.NET_SessionId/i.test(cookie)) {
+          const e = detected.get("asp.net");
+          if (e) e.evidences.push({ signal: "cookie", detail: "ASP.NET_SessionId", weight: 40, tier: "w" });
+        }
+      }
+    }
+
+    // ── 3. Source map decoding (unique data — kept as supplementary) ──
+    const smFound = decodeInlineSourceMaps();
+    for (const [lib, info] of smFound) {
+      if (detected.has(lib)) {
+        // Supplement version if we only have "detected"
+        const existing = detected.get(lib);
+        if (existing.version === "detected" && isValidVersion(info.v)) {
+          existing.version = info.v;
+          existing.method = info.m;
+          existing.evidences.push({ signal: "sourcemap", detail: info.m, weight: 60, version: info.v });
+        }
+      } else {
+        detected.set(lib, {
+          name: lib, version: info.v, method: info.m,
+          confidence: isValidVersion(info.v) ? "medium" : "low",
+          confidenceScore: isValidVersion(info.v) ? 60 : 40,
+          cats: [], evidences: [{ signal: "sourcemap", detail: info.m, weight: 60, version: info.v }],
+        });
+      }
+    }
+
+    // ── 4. Generic banner catch (/*! any-lib v1.2.3 */) ──
+    // Only add if corroborated by a second signal (script src or known CVE DB key)
+    const genericRe = /\/\*!\s*([\w][\w.-]{1,30})\s+v?((\d+)\.(\d+)\.(\d+))/gi;
+    let gm;
+    while ((gm = genericRe.exec(bannerText)) !== null) {
+      const name = gm[1].toLowerCase();
+      if (detected.has(name)) continue;
+      // Corroboration: must be in CVE DB or have a matching script src
+      const inCveDb = typeof GODSEYE_CVE_DB !== "undefined" && GODSEYE_CVE_DB[name];
+      const hasUrlMatch = extUrls.some(u => u.includes(name));
+      if (!inCveDb && !hasUrlMatch) continue;
+      {
+        detected.set(name, {
+          name: gm[1], version: gm[2], method: "banner",
+          confidence: "medium", confidenceScore: 65,
+          cats: [], evidences: [{ signal: "banner", detail: "generic", weight: 65, version: gm[2] }],
+        });
+      }
+    }
+
+    // ── 5. Relationship resolution ──
+    // implies: add implied techs
+    for (const [slug, fp] of Object.entries(GODSEYE_FINGERPRINTS)) {
+      if (!detected.has(slug) || !fp.implies) continue;
+      for (const implied of fp.implies) {
+        if (!detected.has(implied)) {
+          const impliedFp = GODSEYE_FINGERPRINTS[implied];
+          detected.set(implied, {
+            name: impliedFp ? impliedFp.name : implied,
+            version: "detected", method: "implied by " + slug,
+            confidence: "low", confidenceScore: 30,
+            cats: impliedFp ? impliedFp.cats : [],
+            evidences: [{ signal: "implied", detail: "by " + slug, weight: 30 }],
+          });
+        }
+      }
+    }
+
+    // requires: remove tech if required not present
+    for (const [slug, fp] of Object.entries(GODSEYE_FINGERPRINTS)) {
+      if (!detected.has(slug) || !fp.requires) continue;
+      for (const req of fp.requires) {
+        if (!detected.has(req)) { detected.delete(slug); break; }
+      }
+    }
+
+    // excludes: on conflict, keep higher confidence
+    for (const [slug, fp] of Object.entries(GODSEYE_FINGERPRINTS)) {
+      if (!detected.has(slug) || !fp.excludes) continue;
+      for (const exc of fp.excludes) {
+        if (!detected.has(exc)) continue;
+        const myScore = detected.get(slug).confidenceScore;
+        const exScore = detected.get(exc).confidenceScore;
+        if (myScore >= exScore) detected.delete(exc);
+        else { detected.delete(slug); break; }
+      }
+    }
+
+    return detected;
+  }
+
+  /* ================================================================== */
+  /*  2. DOM-only Detection (legacy — kept for WordPress/Next deep)     */
   /* ================================================================== */
 
   function detectFromDOM() {
     const found = new Map();
-    const html = document.documentElement.innerHTML.substring(0, 500000);
+    const html = getPageHTML().substring(0, 500000);
 
     // ── Frameworks via DOM attributes & elements ──
 
@@ -443,7 +792,7 @@
 
   function detectCSSFrameworks() {
     const found = new Map();
-    const html = document.documentElement.innerHTML.substring(0, 200000);
+    const html = getPageHTML().substring(0, 200000);
 
     const checks = [
       { name: "Tailwind CSS",    test: () => /class="[^"]*\b(flex|grid|text-\w+-\d+|bg-\w+-\d+|p-\d|m-\d|rounded-\w+)\b/.test(html) && /class="[^"]*\b(hover:|focus:|sm:|md:|lg:)/.test(html) },
@@ -511,7 +860,7 @@
     }
 
     // Inline flight data analysis
-    const html = document.documentElement.innerHTML;
+    const html = getPageHTML();
     if (/self\.__next_f\.push/.test(html)) signals.push({ type: "flight_push", hint: "RSC Flight data" });
     if (/self\.__BUILD_MANIFEST/.test(html)) signals.push({ type: "build_manifest" });
 
@@ -588,7 +937,7 @@
 
   function mapAttackSurface() {
     const surface = { forms: [], endpoints: [], params: [], uploads: [], websockets: [], hiddenFields: [] };
-    const html = document.documentElement.innerHTML;
+    const html = getPageHTML();
 
     // Forms with details
     document.querySelectorAll("form").forEach(form => {
@@ -708,7 +1057,7 @@
 
   function scanOWASP() {
     const findings = [];
-    const html = document.documentElement.innerHTML.substring(0, 500000);
+    const html = getPageHTML().substring(0, 500000);
     let inlineCode = "";
     document.querySelectorAll("script:not([src])").forEach(s => { inlineCode += s.textContent + "\n"; });
     inlineCode = inlineCode.substring(0, 400000);
@@ -721,13 +1070,13 @@
     document.querySelectorAll('a[href*="admin"], a[href*="dashboard"], a[href*="manage"]').forEach(link => {
       const style = window.getComputedStyle(link);
       if (style.display === "none" || style.visibility === "hidden") {
-        findings.push({ severity: "MEDIUM", title: "Hidden admin link in DOM", detail: link.href, owasp: "A01",
+        findings.push({ severity: "MEDIUM", confidence: "medium", title: "Hidden admin link in DOM", detail: link.href, owasp: "A01",
           exploit: [{ name: "curl", cmd: `curl -s -D- "${link.href}" | head -30` }] });
       }
     });
 
     if (/if\s*\(\s*(?:user\.role|userRole|isAdmin|currentUser\.role)\s*[=!]==?\s*['"`](admin|superadmin)/i.test(inlineCode)) {
-      findings.push({ severity: "HIGH", title: "Client-side access control", detail: "Authorization logic in JS — bypassable from DevTools.", owasp: "A01",
+      findings.push({ severity: "HIGH", confidence: "medium", title: "Client-side access control", detail: "Authorization logic in JS — bypassable from DevTools.", owasp: "A01",
         exploit: [{ name: "browser console", cmd: `// Override the check:\nwindow.isAdmin = true;\n// or:\nObject.defineProperty(user, 'role', { get: () => 'admin' });` }] });
     }
 
@@ -752,22 +1101,43 @@
     const bodyText = document.body ? document.body.innerText.substring(0, 200000) : "";
     const ccMatch = bodyText.match(/\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13})\b/g);
     if (ccMatch) {
-      findings.push({ severity: "CRITICAL", title: `Credit card number(s) in page text`, detail: `Found ${ccMatch.length} pattern(s). Verify manually.`, owasp: "A02" });
+      // Luhn validation to filter false positives (phone numbers, IDs, etc.)
+      const luhnValid = ccMatch.filter(num => {
+        const digits = num.replace(/\D/g, "");
+        let sum = 0;
+        for (let i = digits.length - 1, alt = false; i >= 0; i--, alt = !alt) {
+          let n = parseInt(digits[i], 10);
+          if (alt) { n *= 2; if (n > 9) n -= 9; }
+          sum += n;
+        }
+        return sum % 10 === 0;
+      });
+      if (luhnValid.length > 0) {
+        findings.push({ severity: "CRITICAL", confidence: "high", title: `Credit card number(s) in page text (Luhn-valid)`, detail: `Found ${luhnValid.length} Luhn-valid pattern(s). Verify manually.`, owasp: "A02" });
+      }
     }
 
     // ── A03: Injection ──
 
     try {
       const params = new URLSearchParams(location.search);
-      // Params that are commonly reflected but NOT XSS (IDs, slugs, pagination, etc.)
-      const safeParamNames = /^(v|id|p|page|tab|lang|ref|src|utm_|fbclid|gclid|sort|order|limit|offset|q|s|search|query|category|tag|type|format|callback|_)$/i;
+      // Only skip truly non-reflectable tracking/pagination params
+      const skipParams = /^(utm_.*|fbclid|gclid|_ga|_gid|__cf.*|wbraid|gbraid)$/i;
       params.forEach((value, key) => {
-        if (safeParamNames.test(key)) return;
+        if (skipParams.test(key)) return;
         // Skip short/alphanumeric-only values (IDs, hashes — not exploitable)
         if (/^[a-zA-Z0-9_-]+$/.test(value)) return;
         if (value.length <= 5) return;
         if (html.includes(value)) {
-          findings.push({ severity: "HIGH", title: `Reflected XSS: param "${key}" in DOM`, detail: `Value "${value.substring(0, 40)}" found in page source.`, owasp: "A03",
+          // Context scoring: where is it reflected?
+          const idx = html.indexOf(value);
+          const ctx = html.substring(Math.max(0, idx - 30), idx + value.length + 30);
+          const inScript = /<script[^>]*>[\s\S]*$/.test(html.substring(Math.max(0, idx - 500), idx));
+          const inAttr = /=["'][^"']*$/.test(html.substring(Math.max(0, idx - 80), idx));
+          const inTag = /<[a-z][^>]*$/.test(html.substring(Math.max(0, idx - 100), idx));
+          const contextRisk = inScript ? "js-context" : inAttr ? "attribute" : inTag ? "tag" : "text";
+          const sev = (inScript || inAttr) ? "HIGH" : "MEDIUM";
+          findings.push({ severity: sev, confidence: "high", title: "Reflected param \"" + key + "\" in DOM (" + contextRisk + ")", detail: "Value \"" + value.substring(0, 40) + "\" reflected in " + contextRisk + " context.", owasp: "A03",
             exploit: [
               { name: "curl (XSS test)", cmd: `curl -s "${targetUrl}${location.pathname}?${key}=<script>alert(1)</script>" | grep -i "alert"` },
               { name: "browser", cmd: `${location.origin}${location.pathname}?${key}="><img src=x onerror=alert(document.domain)>` },
@@ -797,18 +1167,66 @@
       findings.push({ severity: "LOW", title: `${jsHrefs.length} javascript: href(s) (static/benign)`, detail: "Static javascript: links found — not exploitable but indicates outdated patterns.", owasp: "A03" });
     }
 
-    const sourceToSink = inlineCode.match(/(?:location\.(hash|search|href)|document\.(URL|referrer|cookie))[\s\S]{0,80}(?:innerHTML|outerHTML|document\.write|eval|\.html\()/gm);
-    if (sourceToSink) {
-      findings.push({ severity: "HIGH", title: `DOM XSS source-to-sink flow (${sourceToSink.length}x)`, detail: sourceToSink.slice(0, 2).map(s => s.substring(0, 100)).join("\n"), owasp: "A03",
+    // DOM XSS source-to-sink: analyse per function/handler scope.
+    // Only HIGH when source + sink appear in the same scope WITHOUT sanitisation.
+    const sourceRe = /location\.(hash|search|href)|document\.(URL|referrer)|(?:URLSearchParams|getParameter|searchParams\.get)\s*\(/g;
+    const sinkRe   = /\.innerHTML\s*=|\.outerHTML\s*=|document\.write\s*\(|[^a-zA-Z_]eval\s*\(|\.insertAdjacentHTML\s*\(|\.html\s*\(/g;
+    const sanitRe  = /escapeHtml|sanitize|encodeURI|encodeURIComponent|DOMPurify\.sanitize|purify|createTextNode|textContent\s*=|xss|htmlEntities|\.text\s*\(/i;
+
+    // Split code into scopes by finding function/arrow boundaries.
+    // For each scope start, find matching closing brace via brace counting.
+    const scopeRe = /(?:function\s*\w*\s*\([^)]*\)\s*\{|(?:\([^)]*\)|[a-zA-Z_$]\w*)\s*=>\s*\{|\.\s*(?:then|catch|addEventListener)\s*\([^)]*(?:function|\(|=>)\s*\{)/g;
+    const scopes = [];
+    let sm;
+    while ((sm = scopeRe.exec(inlineCode)) !== null) {
+      // Find the opening { in the match
+      const braceStart = inlineCode.indexOf("{", sm.index);
+      if (braceStart === -1) continue;
+      // Count braces to find the end of this scope (max 3000 chars)
+      let depth = 0;
+      let end = braceStart;
+      const limit = Math.min(inlineCode.length, braceStart + 3000);
+      for (let ci = braceStart; ci < limit; ci++) {
+        if (inlineCode[ci] === "{") depth++;
+        else if (inlineCode[ci] === "}") { depth--; if (depth === 0) { end = ci; break; } }
+      }
+      scopes.push(inlineCode.substring(braceStart, end + 1));
+    }
+    // Fallback: if no scopes found, treat entire code as one scope
+    if (scopes.length === 0) scopes.push(inlineCode.substring(0, 5000));
+
+    let s2sCount = 0;
+    const s2sDetails = [];
+    for (const scope of scopes) {
+      const hasSource = sourceRe.test(scope); sourceRe.lastIndex = 0;
+      const hasSink   = sinkRe.test(scope);   sinkRe.lastIndex = 0;
+      if (hasSource && hasSink) {
+        const hasSanit = sanitRe.test(scope);
+        if (!hasSanit) {
+          s2sCount++;
+          if (s2sDetails.length < 2) s2sDetails.push(scope.substring(0, 120).replace(/\n/g, " "));
+        }
+      }
+    }
+    if (s2sCount > 0) {
+      // Cap at MEDIUM on heavily minified pages (unreliable scope boundaries)
+      const s2sSev = (inlineCode.length > 100000) ? "MEDIUM" : "HIGH";
+      const s2sConf = (inlineCode.length > 100000) ? "medium" : "high";
+      findings.push({ severity: s2sSev, confidence: s2sConf, title: "DOM XSS source-to-sink flow (" + s2sCount + "x)", detail: s2sDetails.join("\n"), owasp: "A03",
         exploit: [
-          { name: "browser", cmd: `${location.origin}${location.pathname}#<img src=x onerror=alert(document.domain)>` },
-          { name: "browser", cmd: `${location.origin}${location.pathname}?q="><img src=x onerror=alert(1)>` },
+          { name: "browser", cmd: location.origin + location.pathname + "#<img src=x onerror=alert(document.domain)>" },
+          { name: "browser", cmd: location.origin + location.pathname + "?q=\"><img src=x onerror=alert(1)>" },
         ] });
     }
 
-    if (/['"`]\s*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\s+/i.test(inlineCode)) {
-      findings.push({ severity: "MEDIUM", title: "SQL syntax in client-side code", detail: "SQL queries built in JS — server may be vulnerable.", owasp: "A03",
-        exploit: [{ name: "sqlmap", cmd: `sqlmap -u "${targetUrl}/" --forms --batch --level 3 --risk 2` }] });
+    // SQL syntax — only flag if it looks like actual query construction, not ORM/constant strings
+    const sqlMatches = inlineCode.match(/['"`]\s*(?:SELECT|INSERT|UPDATE|DELETE|DROP)\s+(?:\*|INTO|FROM|TABLE|SET)\s/gi);
+    if (sqlMatches) {
+      // Filter out common false positives: GraphQL schema strings, comments, error messages
+      const suspicious = sqlMatches.filter(m => !/error|example|doc|test|spec|mock/i.test(m));
+      if (suspicious.length > 0) {
+        findings.push({ severity: "LOW", title: "SQL-like syntax in client-side code", detail: `${suspicious.length} pattern(s) — may be ORM/query builder. Verify if user input reaches these queries.`, owasp: "A03" });
+      }
     }
 
     // ── A04: Insecure Design ──
@@ -856,7 +1274,7 @@
 
     const docTitle = document.title || "";
     if (/^Index of\s+\//i.test(docTitle)) {
-      findings.push({ severity: "HIGH", title: "Directory listing enabled", detail: `Page title: "${docTitle}"`, owasp: "A05",
+      findings.push({ severity: "HIGH", confidence: "high", title: "Directory listing enabled", detail: `Page title: "${docTitle}"`, owasp: "A05",
         exploit: [
           { name: "curl", cmd: `curl -s "${targetUrl}/" | grep -oP 'href="[^"]*"' | sort -u` },
           { name: "wget", cmd: `wget -r -np -nH "${targetUrl}/" -P ./loot/` },
@@ -865,20 +1283,20 @@
 
     const defaultCreds = html.match(/<!--[\s\S]*?(?:password|credential|default.*?login|admin\s*:\s*admin)[\s\S]*?-->/gi);
     if (defaultCreds) {
-      findings.push({ severity: "HIGH", title: "Credentials in HTML comments", detail: defaultCreds[0].substring(0, 100), owasp: "A05" });
+      findings.push({ severity: "HIGH", confidence: "high", title: "Credentials in HTML comments", detail: defaultCreds[0].substring(0, 100), owasp: "A05" });
     }
 
     // ── A07: Auth Failures ──
 
     const sessionInUrl = location.href.match(/(PHPSESSID|JSESSIONID|session_?id|sid|token|auth)=[a-zA-Z0-9_-]{8,}/i);
     if (sessionInUrl) {
-      findings.push({ severity: "HIGH", title: "Session token in URL", detail: sessionInUrl[0], owasp: "A07",
+      findings.push({ severity: "HIGH", confidence: "high", title: "Session token in URL", detail: sessionInUrl[0], owasp: "A07",
         exploit: [{ name: "session hijack", cmd: `curl -s "${targetUrl}/profile" -b "${sessionInUrl[0]}" | head -30` }] });
     }
 
     const textPasswords = document.querySelectorAll('input[type="text"][name*="pass"], input[type="text"][name*="pwd"]');
     if (textPasswords.length > 0) {
-      findings.push({ severity: "HIGH", title: `${textPasswords.length} password field(s) as type="text"`, detail: "Password visible in cleartext.", owasp: "A07" });
+      findings.push({ severity: "HIGH", confidence: "high", title: `${textPasswords.length} password field(s) as type="text"`, detail: "Password visible in cleartext.", owasp: "A07" });
     }
 
     if (/(user not found|email not registered|no account|username does not exist)/i.test(bodyText)) {
@@ -888,9 +1306,31 @@
 
     // ── A08: Integrity Failures ──
 
-    if (/addEventListener\s*\(\s*['"]message['"]/.test(inlineCode) && !/event\.origin|e\.origin|msg\.origin/.test(inlineCode)) {
-      findings.push({ severity: "HIGH", title: "postMessage without origin check", detail: "Accepts messages from any origin.", owasp: "A08",
-        exploit: [{ name: "PoC (HTML)", cmd: `<html><body>\n<script>\n  const w = window.open('${targetUrl}');\n  setTimeout(() => {\n    w.postMessage('{"action":"xss","data":"<img src=x onerror=alert(1)>"}', '*');\n  }, 2000);\n</script>\n</body></html>` }] });
+    // postMessage — split code at each addEventListener("message" call, then
+    // check if the surrounding context (up to the next function boundary)
+    // contains an origin/source check. This avoids fixed-window false positives.
+    const msgListenerPositions = [];
+    const msgRe = /addEventListener\s*\(\s*['"]message['"]/g;
+    let msgM;
+    while ((msgM = msgRe.exec(inlineCode)) !== null) {
+      msgListenerPositions.push(msgM.index);
+    }
+    if (msgListenerPositions.length > 0) {
+      let hasUncheckedListener = false;
+      for (const pos of msgListenerPositions) {
+        // Extract a generous context after the listener registration
+        // Go until the next top-level function/addEventListener or end of code
+        const after = inlineCode.substring(pos, pos + 2000);
+        const originCheck = /\.origin\s*[!=]==?|\.source\s*[!=]==?|origin\s*[!=]==?|allowedOrigin|trustedOrigin|whitelist/i;
+        if (!originCheck.test(after)) {
+          hasUncheckedListener = true;
+          break;
+        }
+      }
+      if (hasUncheckedListener) {
+        findings.push({ severity: "MEDIUM", confidence: "medium", title: "postMessage listener without origin check", detail: "A message handler may accept messages from any origin. Verify manually in DevTools Sources.", owasp: "A08",
+          exploit: [{ name: "PoC (HTML)", cmd: "<html><body>\n<script>\n  const w = window.open('" + targetUrl + "');\n  setTimeout(() => {\n    w.postMessage('{\"action\":\"test\"}', '*');\n  }, 2000);\n<\/script>\n</body></html>" }] });
+      }
     }
 
     const dynScripts = inlineCode.match(/createElement\s*\(\s*['"]script['"]\)[\s\S]{0,100}\.src\s*=/g);
@@ -911,12 +1351,13 @@
 
     // ── A10: SSRF Indicators ──
 
-    const ssrfInputs = document.querySelectorAll('input[type="url"], input[name*="url" i], input[name*="webhook" i], input[name*="callback" i], input[placeholder*="http"]');
+    // SSRF — only flag inputs strongly associated with server-side fetching, not generic URL fields
+    const ssrfInputs = document.querySelectorAll('input[name*="webhook" i], input[name*="callback" i], input[name*="fetch_url" i], input[name*="proxy" i], input[name*="feed_url" i]');
     if (ssrfInputs.length > 0) {
       const ssrfForm = ssrfInputs[0].closest("form");
       const ssrfAction = ssrfForm ? ssrfForm.action : targetUrl;
       const ssrfName = ssrfInputs[0].name || "url";
-      findings.push({ severity: "MEDIUM", title: `${ssrfInputs.length} URL input(s) — potential SSRF`, detail: [...ssrfInputs].slice(0, 3).map(i => `name="${i.name}"`).join(", "), owasp: "A10",
+      findings.push({ severity: "MEDIUM", title: `${ssrfInputs.length} SSRF-prone input(s)`, detail: [...ssrfInputs].slice(0, 3).map(i => `name="${i.name}"`).join(", "), owasp: "A10",
         exploit: [
           { name: "curl (AWS metadata)", cmd: `curl -s -X POST "${ssrfAction}" -d "${ssrfName}=http://169.254.169.254/latest/meta-data/"` },
           { name: "curl (internal)", cmd: `curl -s -X POST "${ssrfAction}" -d "${ssrfName}=http://127.0.0.1:8080/"` },
@@ -925,20 +1366,34 @@
         burp: `POST ${new URL(ssrfAction, location.origin).pathname} HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\n${ssrfName}=http://169.254.169.254/latest/meta-data/`
       });
     }
+    // Generic URL inputs — informational only
+    const urlInputs = document.querySelectorAll('input[type="url"], input[name*="url" i], input[placeholder*="http"]');
+    const genericUrlInputs = [...urlInputs].filter(i => !i.matches('input[name*="webhook" i], input[name*="callback" i], input[name*="fetch_url" i], input[name*="proxy" i], input[name*="feed_url" i]'));
+    if (genericUrlInputs.length > 0) {
+      const urlNames = [...genericUrlInputs].slice(0, 3).map(i => "name=" + (i.name || "unnamed")).join(", ");
+      findings.push({ severity: "LOW", title: genericUrlInputs.length + " URL input(s) — test for SSRF", detail: urlNames + "\nURL inputs may be client-side only. Verify if server fetches the URL.", owasp: "A10" });
+    }
 
     try {
       const urlParams = new URLSearchParams(location.search);
-      const ssrfParamNames = ["url", "link", "src", "dest", "redirect", "return_url", "next", "target", "uri", "callback", "proxy", "fetch"];
+      // Strong SSRF indicators: params that typically trigger server-side fetches
+      const strongSsrf = ["proxy", "fetch", "webhook", "callback", "feed_url"];
+      // Weaker: could be open redirect but less likely SSRF
+      const weakSsrf = ["url", "link", "src", "dest", "redirect", "return_url", "next", "target", "uri"];
       urlParams.forEach((value, key) => {
-        if (ssrfParamNames.includes(key.toLowerCase()) && /^https?:\/\//.test(value)) {
-          findings.push({ severity: "HIGH", title: `URL param "${key}" — SSRF/open redirect`, detail: `${key}=${value.substring(0, 60)}`, owasp: "A10",
+        const kl = key.toLowerCase();
+        if (!strongSsrf.includes(kl) && !weakSsrf.includes(kl)) return;
+        if (!/^https?:\/\//.test(value)) return;
+        const isStrong = strongSsrf.includes(kl);
+        const sev = isStrong ? "HIGH" : "MEDIUM";
+        const label = isStrong ? "SSRF/open redirect (server-side indicator)" : "Possible open redirect";
+        findings.push({ severity: sev, confidence: isStrong ? "high" : "medium", title: "URL param \"" + key + "\" — " + label, detail: key + "=" + value.substring(0, 60), owasp: "A10",
             exploit: [
               { name: "curl (SSRF)", cmd: `curl -s -D- "${targetUrl}${location.pathname}?${key}=http://169.254.169.254/latest/meta-data/"` },
               { name: "curl (redirect)", cmd: `curl -s -D- "${targetUrl}${location.pathname}?${key}=https://evil.com/"` },
             ],
             burp: `GET ${location.pathname}?${key}=http://169.254.169.254/latest/meta-data/ HTTP/1.1\r\nHost: ${host}\r\nAccept: */*\r\n\r\n`
           });
-        }
       });
     } catch (_) {}
 
@@ -976,7 +1431,7 @@
 
   function scanWordPress() {
     const result = { isWP: false, coreVersion: null, plugins: [], themes: [], cve: [], signals: [] };
-    const html = document.documentElement.innerHTML;
+    const html = getPageHTML();
 
     // Core detection — meta generator
     const gen = document.querySelector('meta[name="generator"]');
@@ -1136,6 +1591,43 @@
   /*  CVE Matching — ONLY on confirmed versions                         */
   /* ================================================================== */
 
+  /**
+   * CVE matching with branched-fix support (safe-zone model, major.minor granularity).
+   *
+   * Each fixedVersion is the first patched release in its major.minor line.
+   * A "safe zone" extends from a fix up to the boundary of the NEXT fix:
+   *   - cross-major:     boundary = nextMajor.0.0
+   *   - same-major:      boundary = nextMajor.nextMinor.0
+   * The last fix's zone extends to infinity.
+   *
+   * Examples:
+   *   fixes ["14.2.25","15.2.3"]     → zones [14.2.25,15.0.0) and [15.2.3,∞)
+   *   fixes ["19.0.1","19.1.2","19.2.1"] → zones [19.0.1,19.1.0) [19.1.2,19.2.0) [19.2.1,∞)
+   */
+  function isFixedByBranch(version, fixedVersions) {
+    const sorted = [...fixedVersions].sort(semverCmp);
+
+    for (let i = 0; i < sorted.length; i++) {
+      const fix = sorted[i];
+
+      if (semverCmp(version, fix) < 0) continue;        // version below this fix
+
+      if (i === sorted.length - 1) return true;          // above last fix → fixed
+
+      // Compute upper boundary of this safe zone
+      const nextFix  = sorted[i + 1];
+      const fParts   = fix.replace(/[^0-9.]/g, "").split(".").map(Number);
+      const nParts   = nextFix.replace(/[^0-9.]/g, "").split(".").map(Number);
+      const boundary = fParts[0] !== nParts[0]
+        ? nParts[0] + ".0.0"                              // cross-major
+        : nParts[0] + "." + nParts[1] + ".0";             // same-major
+
+      if (semverCmp(version, boundary) < 0) return true;  // inside this zone
+      // version >= boundary → falls into next vulnerable gap, keep checking
+    }
+    return false;                                          // below all fixes
+  }
+
   function matchCVEs(libraries) {
     const findings = [];
     for (const [lib, info] of libraries) {
@@ -1145,8 +1637,15 @@
 
       for (const entry of entries) {
         if (!isValidVersion(version)) continue;
-        if (!isBelow(version, entry.fixed)) continue;
         if (entry.from && isBelow(version, entry.from)) continue;
+
+        // Branched fix: use fixedVersions if available
+        if (entry.fixedVersions && entry.fixedVersions.length > 0) {
+          if (isFixedByBranch(version, entry.fixedVersions)) continue;
+        } else {
+          if (!isBelow(version, entry.fixed)) continue;
+        }
+
         findings.push({ ...entry, lib, version, confidence: "confirmed", method: info.m });
       }
     }
@@ -1170,7 +1669,7 @@
         findings.push({ severity: "MEDIUM", title: "CSP allows unsafe-inline", detail: `Weakens XSS protection. Value: ${csp.substring(0, 120)}` });
       if (csp.includes("'unsafe-eval'"))
         findings.push({ severity: "MEDIUM", title: "CSP allows unsafe-eval", detail: `Enables eval-based attacks. Value: ${csp.substring(0, 120)}` });
-      if (csp.includes("*") && !csp.includes("*.google"))
+      if (/(?:^|\s)\*(?:\s|;|$)/.test(csp))
         findings.push({ severity: "MEDIUM", title: "CSP uses wildcard source", detail: "Allows loading resources from any origin." });
     }
     // Don't flag missing CSP meta — most sites use HTTP header CSP which we can't verify passively
@@ -1182,12 +1681,21 @@
         findings.push({ severity: "MEDIUM", title: `Mixed content: ${insecure.length} insecure resource(s)`, detail: [...insecure].slice(0, 5).map(e => e.tagName + ": " + (e.src || e.href)).join("\n") });
     }
 
-    // SRI — skip same-org CDNs (google, facebook, microsoft, etc.)
-    const trustedCDNs = /\.(google|gstatic|googleapis|googlesyndication|doubleclick|facebook|fbcdn|microsoft|msecnd|cloudflare|cloudfront|akamai)\./i;
+    // SRI — flag external scripts without integrity attribute
+    // Skip same-origin and scripts that share the page's eTLD+1 (likely same org)
+    const pageHost = location.hostname;
     const extNoSRI = [];
     document.querySelectorAll("script[src]").forEach(el => {
       if (!el.src || el.src.startsWith(location.origin) || el.integrity) return;
-      if (trustedCDNs.test(el.src)) return; // same trust domain
+      try {
+        const srcHost = new URL(el.src).hostname;
+        // Skip if same registrable domain (e.g. cdn.example.com on example.com)
+        const pageParts = pageHost.split(".");
+        const srcParts = srcHost.split(".");
+        const pageReg = pageParts.slice(-2).join(".");
+        const srcReg = srcParts.slice(-2).join(".");
+        if (pageReg === srcReg) return; // same organization
+      } catch (_) {}
       extNoSRI.push(el.src);
     });
     if (extNoSRI.length > 0)
@@ -1206,27 +1714,23 @@
     const raw = document.cookie;
     if (!raw) return findings;
 
-    // Skip cookie audit on major platforms — their auth cookies are first-party by design
-    const majorPlatforms = /\.(google|youtube|facebook|instagram|twitter|x|microsoft|apple|amazon|github|linkedin|netflix)\./i;
-    if (majorPlatforms.test(location.hostname)) return findings;
-
     const cookies = raw.split(";").map(c => c.trim().split("=")[0]).filter(Boolean);
-    // Filter out well-known non-sensitive cookies
-    const ignoreCookies = /^(PREF|NID|_ga|_gid|_gat|_fbp|_gcl|consent|cookie_consent|lang|locale|theme|timezone|__utm)/i;
+    // Filter out analytics/consent/preference cookies (non-sensitive by nature)
+    const ignoreCookies = /^(_ga|_gid|_gat|_fbp|_gcl|consent|cookie_consent|lang|locale|theme|timezone|__utm|PREF|NID)/i;
     const filtered = cookies.filter(n => !ignoreCookies.test(n));
     const sensitive = filtered.filter(n => /sess|token|auth|jwt|csrf|sid|login|key|api/i.test(n));
     if (sensitive.length > 0)
-      findings.push({ severity: "HIGH", title: `${sensitive.length} sensitive cookie(s) without HttpOnly`, detail: sensitive.join(", ") });
+      findings.push({ severity: "HIGH", title: `${sensitive.length} sensitive cookie(s) accessible to JS`, detail: sensitive.join(", ") + "\nThese cookies lack HttpOnly flag — readable via document.cookie and stealable via XSS." });
     const other = filtered.filter(n => !sensitive.includes(n));
     if (other.length > 3) // Only flag if many — a few is normal
-      findings.push({ severity: "LOW", title: `${other.length} cookie(s) without HttpOnly`, detail: other.slice(0, 5).join(", ") });
+      findings.push({ severity: "LOW", title: `${other.length} cookie(s) accessible to JS (no HttpOnly)`, detail: other.slice(0, 5).join(", ") + "\nNote: cookies with HttpOnly are invisible to JS and cannot be assessed passively." });
 
     return findings;
   }
 
   function scanSecrets() {
     const findings = [];
-    const text = document.documentElement.innerHTML.substring(0, 500000);
+    const text = getPageHTML().substring(0, 500000);
 
     const patterns = [
       { name: "AWS Access Key",     re: /AKIA[0-9A-Z]{16}/g,                                                        sev: "CRITICAL" },
@@ -1265,29 +1769,52 @@
     document.querySelectorAll("script:not([src])").forEach(s => { code += s.textContent + "\n"; });
     code = code.substring(0, 300000);
 
+    // User-controllable sources
+    const userSourceRe = /location\.(hash|search|href)|document\.(URL|referrer)|URLSearchParams|searchParams|getParameter|postMessage|window\.name/;
+
     const sinks = [
-      { name: "eval()",                 re: /[^a-zA-Z_]eval\s*\(/g,             sev: "HIGH" },
-      { name: "Function() constructor", re: /new\s+Function\s*\(/g,             sev: "HIGH" },
-      { name: "document.write()",       re: /document\.write\s*\(/g,            sev: "MEDIUM" },
-      { name: "innerHTML assignment",   re: /\.innerHTML\s*=/g,                 sev: "MEDIUM" },
-      { name: "outerHTML assignment",   re: /\.outerHTML\s*=/g,                 sev: "MEDIUM" },
-      { name: "insertAdjacentHTML()",   re: /\.insertAdjacentHTML\s*\(/g,       sev: "MEDIUM" },
-      { name: "setTimeout(string)",     re: /setTimeout\s*\(\s*["'`]/g,        sev: "MEDIUM" },
-      { name: "setInterval(string)",    re: /setInterval\s*\(\s*["'`]/g,       sev: "MEDIUM" },
+      { name: "eval()",                 re: /[^a-zA-Z_]eval\s*\(/g,             dangerBase: "HIGH" },
+      { name: "Function() constructor", re: /new\s+Function\s*\(/g,             dangerBase: "HIGH" },
+      { name: "document.write()",       re: /document\.write\s*\(/g,            dangerBase: "MEDIUM" },
+      { name: "innerHTML assignment",   re: /\.innerHTML\s*=/g,                 dangerBase: "MEDIUM" },
+      { name: "outerHTML assignment",   re: /\.outerHTML\s*=/g,                 dangerBase: "MEDIUM" },
+      { name: "insertAdjacentHTML()",   re: /\.insertAdjacentHTML\s*\(/g,       dangerBase: "MEDIUM" },
+      { name: "setTimeout(string)",     re: /setTimeout\s*\(\s*["'`]/g,        dangerBase: "MEDIUM" },
+      { name: "setInterval(string)",    re: /setInterval\s*\(\s*["'`]/g,       dangerBase: "MEDIUM" },
     ];
 
     for (const s of sinks) {
-      const m = code.match(s.re);
-      if (m && m.length > 0)
-        findings.push({ severity: s.sev, title: `DOM XSS sink: ${s.name} (${m.length}x)`, detail: `${m.length} instance(s) in inline scripts.`, owasp: "A03",
-          exploit: [{ name: "browser console", cmd: `// Search for this sink in DevTools Sources tab:\n// Ctrl+Shift+F → search for "${s.name.replace(/[()]/g, "")}"\n// Check if user input (URL params, postMessage, etc.) reaches this sink` }] });
+      const matches = [];
+      let m;
+      while ((m = s.re.exec(code)) !== null) matches.push(m.index);
+      if (matches.length === 0) continue;
+
+      // Check if ANY match has a user source nearby (±800 chars = rough scope)
+      let hasNearbySource = false;
+      for (const pos of matches) {
+        const vicinity = code.substring(Math.max(0, pos - 400), pos + 400);
+        if (userSourceRe.test(vicinity)) { hasNearbySource = true; break; }
+      }
+
+      if (hasNearbySource) {
+        // Source near sink → elevated severity, high confidence
+        findings.push({ severity: s.dangerBase, confidence: "high",
+          title: "DOM XSS sink with user source: " + s.name + " (" + matches.length + "x)",
+          detail: matches.length + " instance(s) — user-controllable input detected near sink.", owasp: "A03",
+          exploit: [{ name: "browser console", cmd: "// Ctrl+Shift+F in DevTools → search for \"" + s.name.replace(/[()]/g, "") + "\"\n// Trace the data flow from the user source to this sink" }] });
+      } else {
+        // Sink only, no user source nearby → INFO (code hygiene)
+        findings.push({ severity: "INFO", confidence: "low",
+          title: "DOM sink present: " + s.name + " (" + matches.length + "x)",
+          detail: matches.length + " instance(s). No user-controllable source detected nearby — low risk.", owasp: "A03" });
+      }
     }
     return findings;
   }
 
   function scanInfoDisclosure() {
     const findings = [];
-    const html = document.documentElement.innerHTML.substring(0, 200000);
+    const html = getPageHTML().substring(0, 200000);
 
     const comments = html.match(/<!--[\s\S]*?-->/g) || [];
     const sensitive = comments.filter(c => /todo|fixme|hack|password|secret|token|api.?key|bug|debug|admin/i.test(c));
@@ -1330,20 +1857,26 @@
   /* ================================================================== */
 
   async function runFullScan() {
-    // Phase 1: parallel — main world + DOM-only
-    const [mainWorldData, domData] = await Promise.all([
+    // Invalidate HTML cache so we get a fresh snapshot for this scan
+    invalidateHTMLCache();
+
+    // Phase 1: parallel — main world probe + passive headers
+    const [mainWorldData, headerData] = await Promise.all([
       probeMainWorld(),
-      Promise.resolve(detectFromDOM()),
+      fetchPassiveHeaders(),
     ]);
 
-    // Phase 2: synchronous scans
-    const banners = parseBanners();
-    const urls = matchScriptURLs();
-    const sourceMaps = decodeInlineSourceMaps();
-    const css = detectCSSFrameworks();
+    // Phase 2: fingerprint engine (replaces old scattered detection)
+    const fpResults = runFingerprintEngine(mainWorldData, headerData);
 
-    // Phase 3: merge libraries
-    const libraries = mergeLibraries(mainWorldData, domData, banners, urls, sourceMaps, css);
+    // Phase 2b: legacy DOM detection (still needed for Next.js deep + WP internals)
+    const domData = detectFromDOM();
+
+    // Phase 3: convert fingerprint results to library Map for CVE matching
+    const libraries = new Map();
+    for (const [slug, info] of fpResults) {
+      libraries.set(slug, { v: info.version, m: info.method });
+    }
 
     // Phase 4: deep analysis
     const nextjs = detectNextJsDeep(mainWorldData, domData);
@@ -1370,10 +1903,21 @@
     const infoDisc = scanInfoDisclosure();
     const forms = auditForms();
 
-    // Build results
+    // Compute inline script size for anti-noise threshold
+    let inlineScriptSize = 0;
+    document.querySelectorAll("script:not([src])").forEach(s => { inlineScriptSize += s.textContent.length; });
+
+    // Build results — include fingerprint evidence
     const libsForUI = {};
     for (const [lib, info] of libraries) {
-      libsForUI[lib] = { version: info.v, method: info.m };
+      const fpInfo = fpResults.get(lib);
+      libsForUI[lib] = {
+        version: info.v,
+        method: info.m,
+        confidence: fpInfo ? fpInfo.confidence : (isValidVersion(info.v) ? "high" : "low"),
+        cats: fpInfo ? fpInfo.cats : [],
+        evidences: fpInfo ? fpInfo.evidences : [],
+      };
     }
 
     // Unified vulnerabilities array — everything in one place, sorted by severity
@@ -1389,6 +1933,30 @@
       ...infoDisc.map(f => ({ ...f, source: "Info" })),
       ...cookies.filter(f => f.severity === "LOW" || f.severity === "INFO").map(f => ({ ...f, source: "Cookies" })),
     ];
+    // ── Confidence assignment & evidence-threshold anti-noise ──
+    // Rules:
+    //  - CVE + confirmed version → high
+    //  - exploit present or DOM evidence → high
+    //  - heuristic/regex-only → medium or low
+    //  - single regex hit on large/minified page → downgrade
+    const isMinified = inlineScriptSize > 50000;  // rough: lots of inline JS = bundled/minified
+    for (const v of vulnerabilities) {
+      // Default confidence based on source
+      if (!v.confidence) {
+        if (v.source === "CVE" || v.source === "WordPress") v.confidence = "high";
+        else if (v.source === "Secrets") v.confidence = "high";
+        else if (v.source === "Forms" && v.severity === "CRITICAL") v.confidence = "high";
+        else if (v.exploit && v.exploit.length > 0) v.confidence = "medium";
+        else v.confidence = "low";
+      }
+      // Anti-noise: on minified/bundled pages, single-regex heuristics are unreliable
+      // Downgrade LOW-confidence findings that are MEDIUM+ to one level lower
+      if (isMinified && v.confidence === "low") {
+        if (v.severity === "HIGH") v.severity = "MEDIUM";
+        else if (v.severity === "MEDIUM") v.severity = "LOW";
+      }
+    }
+
     vulnerabilities.sort((a, b) => (GODSEYE_SEVERITY_WEIGHT[b.severity] || 0) - (GODSEYE_SEVERITY_WEIGHT[a.severity] || 0));
 
     // Attach exploit commands from CVE exploit-gen to matching vulns
@@ -1408,12 +1976,15 @@
       wordpress: wordpress.isWP ? wordpress : null,
       nextjs: nextjs,
       reactInference: reactInference,
-      cssFrameworks: Object.fromEntries(css),
+      cssFrameworks: Object.fromEntries(
+        [...fpResults].filter(([, v]) => v.cats.includes("css-framework")).map(([k, v]) => [k, { v: v.version, m: v.method }])
+      ),
       attackSurface: attackSurface,
       meta: {
         url: location.href,
         timestamp: Date.now(),
-        detectionMethods: ["main_world", "dom_properties", "banners", "script_urls", "source_maps", "css_fingerprint", "wordpress", "owasp"],
+        detectionMethods: ["main_world", "fingerprints", "source_maps", "wordpress", "owasp", ...(headerData ? ["response_headers"] : [])],
+        headersAvailable: !!headerData,
       }
     };
 
@@ -1425,22 +1996,36 @@
     return results;
   }
 
-  // Run scan and store results
+  // Run scan once and reuse the promise — prevents duplicate scans
+  const emptyResults = {
+    libraries: {}, vulnerabilities: [], wordpress: null, nextjs: null,
+    reactInference: null, cssFrameworks: {}, attackSurface: { forms: [], endpoints: [], params: [], uploads: [], websockets: [], hiddenFields: [] },
+    meta: { url: location.href, timestamp: Date.now(), error: true }
+  };
+
+  const scanPromise = runFullScan().catch(() => emptyResults);
   let scanResults = null;
 
-  runFullScan().then(results => {
+  scanPromise.then(results => {
     scanResults = results;
   });
 
-  // Message listener
+  // Message listener — waits for existing scan, supports re-scan for SPAs
   chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
     if (req.action === "get_scan") {
       if (scanResults) {
         sendResponse(scanResults);
         return false;
       }
-      // Scan still running — wait for it
-      runFullScan().then(results => {
+      // Scan still running — wait for the existing promise
+      scanPromise.then(results => {
+        sendResponse(results);
+      });
+      return true;
+    }
+    if (req.action === "rescan") {
+      // Force a fresh scan (for SPAs that navigated client-side)
+      runFullScan().catch(() => emptyResults).then(results => {
         scanResults = results;
         sendResponse(results);
       });

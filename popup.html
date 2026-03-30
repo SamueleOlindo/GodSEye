@@ -234,11 +234,15 @@
       border-radius: 2px;
       font-size: 8px;
     }
-    .confidence-tag.high {
+    .confidence-tag.high, .confidence-tag.confirmed {
       background: rgba(255, 23, 68, 0.15);
       color: var(--critical);
     }
-    .confidence-tag.low {
+    .confidence-tag.medium {
+      background: rgba(255, 171, 0, 0.15);
+      color: var(--medium);
+    }
+    .confidence-tag.low, .confidence-tag.unverified {
       background: rgba(84, 110, 122, 0.2);
       color: var(--info);
     }
@@ -262,6 +266,15 @@
     .lib-chip .lib-name { color: var(--text); font-weight: 600; }
     .lib-chip .lib-ver { color: var(--accent); }
     .lib-chip.vuln { border-color: var(--critical); background: rgba(255, 23, 68, 0.06); }
+    .conf-dot { display: inline-block; width: 5px; height: 5px; border-radius: 50%; margin-right: 3px; flex-shrink: 0; }
+    .conf-dot.high { background: var(--safe); }
+    .conf-dot.medium { background: var(--medium); }
+    .conf-dot.low { background: var(--info); }
+    .lib-chip.conf-low { opacity: 0.55; }
+    body.hide-low .lib-chip.conf-low { display: none; }
+    body.hide-low .finding-low-conf { display: none; }
+    .toggle-row { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 9px; color: var(--text-dim); cursor: pointer; user-select: none; }
+    .toggle-row input { accent-color: var(--accent); }
 
     /* ---- Exploit / Copy blocks ---- */
     .cmd-block {
@@ -392,7 +405,25 @@
       color: var(--text-dim);
       border-top: 1px solid var(--border);
       letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
     }
+    .rescan-btn {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--accent);
+      font-size: 8px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: inherit;
+      letter-spacing: 0.5px;
+      transition: all 0.15s;
+    }
+    .rescan-btn:hover { background: var(--accent-dim); border-color: var(--accent); }
+    .rescan-btn:disabled { opacity: 0.5; cursor: wait; }
   </style>
 </head>
 <body>

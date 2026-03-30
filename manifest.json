@@ -5,7 +5,8 @@
   "description": "Passive web vulnerability scanner. Sees everything, touches nothing.",
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -30,7 +31,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["cve-db.js", "wp-cve-db.js", "exploit-gen.js", "content.js"],
+      "js": ["cve-db.js", "wp-cve-db.js", "exploit-gen.js", "fingerprints.js", "content.js"],
       "run_at": "document_idle"
     }
   ]

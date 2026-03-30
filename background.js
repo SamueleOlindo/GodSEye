@@ -1,4 +1,52 @@
+// Inject content scripts into existing tabs on install/update so users
+// don't have to manually reload every open page.
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.tabs.query({ url: ["http://*/*", "https://*/*"] }, (tabs) => {
+    const scripts = ["cve-db.js", "wp-cve-db.js", "exploit-gen.js", "fingerprints.js", "content.js"];
+    for (const tab of tabs) {
+      chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: scripts,
+      }).catch(() => { /* tab may be restricted (chrome://, edge://, etc.) */ });
+    }
+  });
+});
+
+// ── Passive network signal collector ──
+// Observes response headers from requests the browser already made.
+// Zero new requests — purely passive observation.
+const _headerCache = new Map(); // tabId → { server, poweredBy, setCookies[], contentType }
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    if (details.type !== "main_frame") return;
+    const entry = { server: null, poweredBy: null, setCookies: [], contentType: null, via: null };
+    for (const h of (details.responseHeaders || [])) {
+      const name = h.name.toLowerCase();
+      if (name === "server") entry.server = h.value;
+      else if (name === "x-powered-by") entry.poweredBy = h.value;
+      else if (name === "set-cookie") entry.setCookies.push(h.value);
+      else if (name === "content-type") entry.contentType = h.value;
+      else if (name === "via") entry.via = h.value;
+      else if (name === "x-aspnet-version") entry.poweredBy = (entry.poweredBy || "") + " ASP.NET/" + h.value;
+      else if (name === "x-drupal-cache" || name === "x-generator") entry.poweredBy = (entry.poweredBy || "") + " " + h.value;
+    }
+    _headerCache.set(details.tabId, entry);
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
+);
+
+// Clean up on tab close
+chrome.tabs.onRemoved.addListener((tabId) => { _headerCache.delete(tabId); });
+
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  // Serve cached headers to content script
+  if (req.action === "get_headers" && sender.tab) {
+    sendResponse(_headerCache.get(sender.tab.id) || null);
+    return false;
+  }
+
   if (req.action === "update_badge" && sender.tab) {
     const n = req.count || 0;
     const color = n >= 10 ? "#e74c3c" : n >= 4 ? "#e67e22" : n >= 1 ? "#f1c40f" : "#2ecc71";

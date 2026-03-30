@@ -1,26 +1,38 @@
-// Global copy handler
-function copyCmd(btn) {
-  const block = btn.parentElement;
-  const cmd = block.getAttribute("data-cmd");
-  navigator.clipboard.writeText(cmd).then(() => {
-    btn.textContent = "COPIED";
-    btn.classList.add("copied");
-    setTimeout(() => { btn.textContent = "COPY"; btn.classList.remove("copied"); }, 1500);
-  });
-}
-
 (() => {
   "use strict";
 
   const $ = (sel) => document.querySelector(sel);
   const app = $("#app");
 
+  // Event delegation for COPY buttons — MV3 CSP blocks inline onclick handlers
+  document.addEventListener("click", (e) => {
+    const btn = e.target.closest(".copy-btn");
+    if (!btn) return;
+    const block = btn.closest(".cmd-block");
+    if (!block) return;
+    const cmd = block.getAttribute("data-cmd");
+    navigator.clipboard.writeText(cmd).then(() => {
+      btn.textContent = "COPIED";
+      btn.classList.add("copied");
+      setTimeout(() => { btn.textContent = "COPY"; btn.classList.remove("copied"); }, 1500);
+    }).catch(() => {
+      btn.textContent = "FAILED";
+      setTimeout(() => { btn.textContent = "COPY"; }, 1500);
+    });
+  });
+
   function severityClass(sev) { return (sev || "info").toLowerCase(); }
 
   function escapeHtml(str) {
-    const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
-    return String(str).replace(/[&<>"]/g, c => map[c]);
+    const map = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return String(str).replace(/[&<>"']/g, c => map[c]);
   }
+
+  /** Escape for use inside HTML attribute values (double-quoted). */
+  function safeAttr(str) { return escapeHtml(str); }
+
+  /** Sanitise a string for use as a CSS class name (only alnum/hyphen). */
+  function safeClass(str) { return String(str).replace(/[^a-zA-Z0-9_-]/g, ""); }
 
   function countBySeverity(list, ...sevs) {
     return list.filter(f => sevs.includes(f.severity)).length;
@@ -32,32 +44,34 @@ function copyCmd(btn) {
     const cls = severityClass(f.severity);
 
     let meta = "";
-    if (f.cve) meta += `<span class="cve-tag">${f.cve}</span>`;
-    if (f.owasp) meta += `<span style="color:var(--medium);font-weight:600">${f.owasp}</span>`;
-    if (f.source) meta += `<span style="color:var(--text-dim)">${f.source}</span>`;
-    if (f.lib) meta += `<span class="lib-tag">${f.lib}${f.version ? "@" + f.version : ""}</span>`;
-    if (f.fixed) meta += `<span>fixed: ${f.fixed}</span>`;
-    if (f.confidence) meta += `<span class="confidence-tag ${f.confidence}">${f.confidence}</span>`;
-    if (f.method) meta += `<span style="color:var(--accent)">via ${f.method}</span>`;
-    if (f.note) meta += `<span>${f.note}</span>`;
+    if (f.cve) meta += `<span class="cve-tag">${escapeHtml(f.cve)}</span>`;
+    if (f.owasp) meta += `<span style="color:var(--medium);font-weight:600">${escapeHtml(f.owasp)}</span>`;
+    if (f.source) meta += `<span style="color:var(--text-dim)">${escapeHtml(f.source)}</span>`;
+    if (f.lib) meta += `<span class="lib-tag">${escapeHtml(f.lib)}${f.version ? "@" + escapeHtml(f.version) : ""}</span>`;
+    if (f.fixed) meta += `<span>fixed: ${escapeHtml(f.fixed)}</span>`;
+    if (f.confidence) meta += `<span class="confidence-tag ${safeClass(f.confidence)}">${escapeHtml(f.confidence)}</span>`;
+    if (f.method) meta += `<span style="color:var(--accent)">via ${escapeHtml(f.method)}</span>`;
+    if (f.note) meta += `<span>${escapeHtml(f.note)}</span>`;
 
     let exploitHtml = "";
     if (f.exploit && f.exploit.length > 0) {
       for (const tool of f.exploit) {
         exploitHtml += `<div class="cmd-label"><span class="tool-name">${escapeHtml(tool.name)}</span></div>`;
-        exploitHtml += `<div class="cmd-block" data-cmd="${escapeHtml(tool.cmd)}"><button class="copy-btn" onclick="copyCmd(this)">COPY</button>${escapeHtml(tool.cmd)}</div>`;
+        exploitHtml += `<div class="cmd-block" data-cmd="${escapeHtml(tool.cmd)}"><button class="copy-btn">COPY</button>${escapeHtml(tool.cmd)}</div>`;
       }
     }
 
     if (f.burp) {
       exploitHtml += `<div class="cmd-label">burp repeater</div>`;
-      exploitHtml += `<div class="cmd-block burp" data-cmd="${escapeHtml(f.burp)}"><button class="copy-btn" onclick="copyCmd(this)">COPY</button>${escapeHtml(f.burp.replace(/\\r\\n/g, "\r\n"))}</div>`;
+      exploitHtml += `<div class="cmd-block burp" data-cmd="${escapeHtml(f.burp)}"><button class="copy-btn">COPY</button>${escapeHtml(f.burp.replace(/\\r\\n/g, "\r\n"))}</div>`;
     }
 
+    const lowConf = (f.confidence === "low" || f.confidence === "unverified") ? " finding-low-conf" : "";
+
     return `
-      <div class="finding ${cls}">
+      <div class="finding ${safeClass(cls)}${lowConf}">
         <div class="finding-top">
-          <span class="sev-badge ${cls}">${f.severity}</span>
+          <span class="sev-badge ${safeClass(cls)}">${escapeHtml(f.severity)}</span>
           <span class="finding-title">${escapeHtml(f.title)}</span>
         </div>
         ${f.detail ? `<div class="finding-detail">${escapeHtml(f.detail)}</div>` : ""}
@@ -77,10 +91,14 @@ function copyCmd(btn) {
     const chips = entries.map(([name, info]) => {
       const ver = info.version || info.v || "detected";
       const method = info.method || info.m || "";
+      const conf = info.confidence || "low";
       const isVuln = vulnLibs.has(name);
       const verDisplay = ver === "detected" ? "?" : ver;
-      const tooltip = method ? `title="via: ${method}"` : "";
-      return `<span class="lib-chip${isVuln ? " vuln" : ""}" ${tooltip}><span class="lib-name">${escapeHtml(name)}</span><span class="lib-ver">${escapeHtml(verDisplay)}</span></span>`;
+      // Build evidence summary for tooltip
+      const evSummary = (info.evidences || []).map(e => escapeHtml(e.signal + ": " + (e.detail || "").substring(0, 40))).join(", ");
+      const tooltip = `title="${safeAttr((method ? "via: " + method : "") + (evSummary ? " | " + evSummary : ""))}"`;
+      const confDot = `<span class="conf-dot ${safeClass(conf)}"></span>`;
+      return `<span class="lib-chip${isVuln ? " vuln" : ""} conf-${safeClass(conf)}" ${tooltip}>${confDot}<span class="lib-name">${escapeHtml(name)}</span><span class="lib-ver">${escapeHtml(verDisplay)}</span></span>`;
     }).join("");
 
     return `
@@ -164,9 +182,9 @@ function copyCmd(btn) {
   function renderNextJs(nj) {
     if (!nj || (!nj.version && !nj.router && nj.signals.length === 0)) return "";
     let html = "";
-    if (nj.version) html += `<div class="finding-detail">Version: <strong style="color:var(--accent)">${nj.version}</strong></div>`;
-    else if (nj.inferredRange) html += `<div class="finding-detail">Range: <strong style="color:var(--medium)">${nj.inferredRange}</strong></div>`;
-    if (nj.router) html += `<div class="finding-detail">Router: <strong>${nj.router}</strong></div>`;
+    if (nj.version) html += `<div class="finding-detail">Version: <strong style="color:var(--accent)">${escapeHtml(nj.version)}</strong></div>`;
+    else if (nj.inferredRange) html += `<div class="finding-detail">Range: <strong style="color:var(--medium)">${escapeHtml(nj.inferredRange)}</strong></div>`;
+    if (nj.router) html += `<div class="finding-detail">Router: <strong>${escapeHtml(nj.router)}</strong></div>`;
     if (nj.vulnStatus === "likely_vulnerable")
       html += `<div class="finding-detail" style="color:var(--critical);font-weight:600">CVE-2025-55182: LIKELY VULNERABLE</div>`;
     const sigs = nj.signals.map(s => `${s.type || "signal"}: ${s.value || s.hint || s.buildId || ""}`).join("\n");
@@ -185,7 +203,7 @@ function copyCmd(btn) {
 
   function renderReact(ri) {
     if (!ri) return "";
-    let html = `<div class="finding-detail">Range: <strong style="color:var(--accent)">${ri.range}</strong></div>`;
+    let html = `<div class="finding-detail">Range: <strong style="color:var(--accent)">${escapeHtml(ri.range)}</strong></div>`;
     html += `<div class="finding-detail" style="font-size:9px;color:var(--text-dim)">${ri.signals.map(escapeHtml).join("<br>")}</div>`;
     return `
       <div class="section" data-section="react">
@@ -208,12 +226,12 @@ function copyCmd(btn) {
       const flags = [];
       if (form.hasFile) flags.push("UPLOAD");
       if (form.hasPassword) flags.push("AUTH");
-      html += `<div class="surface-item"><span class="surface-method ${form.method}">${form.method}</span><span class="surface-path">${escapeHtml(form.action)}</span>${flags.map(f => `<span class="surface-method UPLOAD">${f}</span>`).join("")}</div>`;
+      html += `<div class="surface-item"><span class="surface-method ${safeClass(form.method)}">${escapeHtml(form.method)}</span><span class="surface-path">${escapeHtml(form.action)}</span>${flags.map(f => `<span class="surface-method UPLOAD">${escapeHtml(f)}</span>`).join("")}</div>`;
       if (inputList) html += `<div style="font-size:9px;color:var(--text-dim);padding:0 8px 4px">${escapeHtml(inputList)}</div>`;
     }
 
     for (const ep of surface.endpoints.slice(0, 30)) {
-      html += `<div class="surface-item"><span class="surface-method ${ep.method || "GET"}">${ep.method || "API"}</span><span class="surface-path">${escapeHtml(ep.path)}</span><span class="surface-source">${ep.source}</span></div>`;
+      html += `<div class="surface-item"><span class="surface-method ${safeClass(ep.method || "GET")}">${escapeHtml(ep.method || "API")}</span><span class="surface-path">${escapeHtml(ep.path)}</span><span class="surface-source">${escapeHtml(ep.source)}</span></div>`;
     }
 
     for (const up of surface.uploads) {
@@ -297,6 +315,11 @@ function copyCmd(btn) {
         <div class="target-url">${escapeHtml(url)}</div>
       </div>
 
+      <div class="toggle-row" style="padding:6px 16px 0">
+        <input type="checkbox" id="lcToggle" checked>
+        <label for="lcToggle">Show low-confidence findings</label>
+      </div>
+
       ${renderLibraries(data.libraries, vulns)}
       ${renderVulnerabilities(vulns)}
       ${renderWordPress(data.wordpress)}
@@ -312,27 +335,61 @@ function copyCmd(btn) {
         </div>
       ` : ""}
 
-      <div class="footer">GodSEye v2.0 &mdash; 0 requests &mdash; passive scan &rarr; exploit ready</div>
+      <div class="footer">
+        <span>GodSEye v2.0 &mdash; 0 requests &mdash; passive</span>
+        <button class="rescan-btn" id="rescanBtn" title="Re-scan page (useful for SPAs)">RE-SCAN</button>
+      </div>
     `;
 
     document.querySelectorAll(".section-header").forEach(h => {
       h.addEventListener("click", () => h.parentElement.classList.toggle("open"));
     });
+
+    // Low-confidence toggle
+    const lcToggle = document.getElementById("lcToggle");
+    if (lcToggle) {
+      lcToggle.addEventListener("change", () => {
+        document.body.classList.toggle("hide-low", !lcToggle.checked);
+      });
+    }
+
+    // Rescan button handler
+    const rescanBtn = document.getElementById("rescanBtn");
+    if (rescanBtn) {
+      rescanBtn.addEventListener("click", () => {
+        rescanBtn.textContent = "SCANNING...";
+        rescanBtn.disabled = true;
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+          if (!tabs[0]) return;
+          chrome.tabs.sendMessage(tabs[0].id, { action: "rescan" }, (res) => {
+            if (chrome.runtime.lastError || !res) {
+              rescanBtn.textContent = "FAILED";
+              setTimeout(() => { rescanBtn.textContent = "RE-SCAN"; rescanBtn.disabled = false; }, 1500);
+              return;
+            }
+            render(res);
+          });
+        });
+      });
+    }
   }
 
-  // Init
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (!tabs[0]) return;
-    chrome.tabs.sendMessage(tabs[0].id, { action: "get_scan" }, (res) => {
-      if (chrome.runtime.lastError || !res) {
-        app.innerHTML = `
-          <div class="header"><div class="header-top"><div class="logo"><div class="eye-icon"></div><div><div class="logo-text">GodSEye</div><div class="logo-sub">passive recon // zero noise</div></div></div></div></div>
-          <div class="empty" style="padding:30px"><div class="icon" style="color:var(--medium)">!</div>Could not reach content script.<br>Refresh the page and try again.</div>
-          <div class="footer">GodSEye v2.0</div>`;
-        return;
-      }
-      render(res);
+  // Init — request scan results from content script
+  function initPopup() {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0]) return;
+      chrome.tabs.sendMessage(tabs[0].id, { action: "get_scan" }, (res) => {
+        if (chrome.runtime.lastError || !res) {
+          app.innerHTML = `
+            <div class="header"><div class="header-top"><div class="logo"><div class="eye-icon"></div><div><div class="logo-text">GodSEye</div><div class="logo-sub">passive recon // zero noise</div></div></div></div></div>
+            <div class="empty" style="padding:30px"><div class="icon" style="color:var(--medium)">!</div>Could not reach content script.<br>Refresh the page and try again.</div>
+            <div class="footer">GodSEye v2.0</div>`;
+          return;
+        }
+        render(res);
+      });
     });
-  });
+  }
+  initPopup();
 
 })();
