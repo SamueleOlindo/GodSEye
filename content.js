@@ -1628,8 +1628,31 @@
     return false;                                          // below all fixes
   }
 
+  /**
+   * Find the relevant fix version for a given version within fixedVersions.
+   * Returns the fix for the matching major.minor branch, or the base `fixed`.
+   */
+  function relevantFixForBranch(version, fixedVersions) {
+    const vParts = version.replace(/[^0-9.]/g, "").split(".").map(Number);
+    const vMajor = vParts[0] || 0;
+    const vMinor = vParts[1] || 0;
+    for (const fv of fixedVersions) {
+      const fParts = fv.replace(/[^0-9.]/g, "").split(".").map(Number);
+      if ((fParts[0] || 0) === vMajor && (fParts[1] || 0) === vMinor) return fv;
+    }
+    // No exact branch match — return the next fix above this version
+    const sorted = [...fixedVersions].sort(semverCmp);
+    for (const fv of sorted) {
+      if (semverCmp(fv, version) > 0) return fv;
+    }
+    return sorted[sorted.length - 1];
+  }
+
   function matchCVEs(libraries) {
     const findings = [];
+    // Collect detected tech slugs for context checks
+    const detectedSlugs = new Set(libraries.keys());
+
     for (const [lib, info] of libraries) {
       const version = info.v;
       const entries = GODSEYE_CVE_DB[lib];
@@ -1646,7 +1669,30 @@
           if (!isBelow(version, entry.fixed)) continue;
         }
 
-        findings.push({ ...entry, lib, version, confidence: "confirmed", method: info.m });
+        // Compute branch-relevant fix version for display
+        let displayFix = entry.fixed;
+        if (entry.fixedVersions && entry.fixedVersions.length > 0) {
+          displayFix = relevantFixForBranch(version, entry.fixedVersions);
+        }
+
+        // Context check: some CVEs require specific tech to be exploitable
+        let severity = entry.severity;
+        let note = entry.note || null;
+        if (entry.requiresContext) {
+          const hasContext = entry.requiresContext.some(ctx => detectedSlugs.has(ctx));
+          if (!hasContext) {
+            severity = entry.noContextSeverity || "LOW";
+            note = entry.noContextNote || "Required context not detected — likely not exploitable.";
+          }
+        }
+
+        findings.push({
+          ...entry,
+          severity,
+          fixed: displayFix,
+          note,
+          lib, version, confidence: "confirmed", method: info.m,
+        });
       }
     }
     findings.sort((a, b) => (GODSEYE_SEVERITY_WEIGHT[b.severity] || 0) - (GODSEYE_SEVERITY_WEIGHT[a.severity] || 0));
